@@ -146,6 +146,7 @@ static bool *cpuMST(const ECLgraph &g)
 
 static inline __device__ int find(int curr, const int *const __restrict__ parent)
 {
+    // standard find without path compression
     int next;
     while (curr != (next = parent[curr]))
     {
@@ -372,7 +373,8 @@ static bool *gpuMST(const ECLgraph &g, const int threshold)
         if (wlsize > 0)
         {
             kernel2<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_parent, d_minv, d_inMST);
-            kernel3<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_minv);
+            // kernel3<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_minv);
+            cudaMemset(d_minv, 0xFF, g.nodes * sizeof(ull));
         }
     }
 
@@ -391,7 +393,8 @@ static bool *gpuMST(const ECLgraph &g, const int threshold)
             if (wlsize > 0)
             {
                 kernel2<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_parent, d_minv, d_inMST);
-                kernel3<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_minv);
+                // kernel3<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_minv);
+                cudaMemset(d_minv, 0xFF, g.nodes * sizeof(ull));
             }
         }
     }
