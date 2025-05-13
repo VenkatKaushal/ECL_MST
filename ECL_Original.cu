@@ -41,10 +41,7 @@ Alex Fallin, Andres Gonzalez, Jarim Seo, and Martin Burtscher. A High-Performanc
 #include <sys/time.h>
 #include <cuda.h>
 #include "ECLgraph.h"
-#include <cooperative_groups.h>
-#include <cstdio>
 
-using namespace cooperative_groups;
 static const int Device = 0;
 static const int ThreadsPerBlock = 512;
 
@@ -146,7 +143,6 @@ static bool *cpuMST(const ECLgraph &g)
 
 static inline __device__ int find(int curr, const int *const __restrict__ parent)
 {
-    // standard find without path compression
     int next;
     while (curr != (next = parent[curr]))
     {
@@ -165,11 +161,9 @@ static inline __device__ void join(int arep, int brep, int *const __restrict__ p
     } while ((brep = atomicCAS(&parent[mrep], mrep, arep)) != mrep);
 }
 
-static __global__ void initPM(const int nodes,
-                              int *const __restrict__ parent,
-                              ull *const __restrict__ minv)
+static __global__ void initPM(const int nodes, int *const __restrict__ parent, ull *const __restrict__ minv)
 {
-    int v = blockIdx.x * ThreadsPerBlock + threadIdx.x;
+    const int v = threadIdx.x + blockIdx.x * ThreadsPerBlock;
     if (v < nodes)
     {
         parent[v] = v;
@@ -178,73 +172,61 @@ static __global__ void initPM(const int nodes,
 }
 
 template <bool first>
-static __global__ void initWL(int4 *const __restrict__ wl2,
-                              int *const __restrict__ wl2size,
-                              const int nodes,
-                              const int *const __restrict__ nindex,
-                              const int *const __restrict__ nlist,
-                              const int *const __restrict__ eweight,
-                              ull *const __restrict__ minv,
-                              const int *const __restrict__ parent,
-                              const int threshold)
+static __global__ void initWL(int4 *const __restrict__ wl2, int *const __restrict__ wl2size, const int nodes, const int *const __restrict__ nindex, const int *const __restrict__ nlist, const int *const __restrict__ eweight, ull *const __restrict__ minv, const int *const __restrict__ parent, const int threshold)
 {
-    int v = blockIdx.x * ThreadsPerBlock + threadIdx.x;
-    if (v >= nodes)
-        return;
-
-    // Use __ldg to load read-only arrays into the read-only cache
-    int beg = __ldg(&nindex[v]);
-    int end = __ldg(&nindex[v + 1]);
-    int deg = end - beg;
-    int arep = first ? v : find(v, parent);
-
-    if (deg < 4)
+    const int v = threadIdx.x + blockIdx.x * ThreadsPerBlock;
+    int beg, end, arep, deg = -1;
+    if (v < nodes)
     {
-        for (int j = beg; j < end; ++j)
+        beg = nindex[v];
+        end = nindex[v + 1];
+        deg = end - beg;
+        arep = first ? v : find(v, parent);
+        if (deg < 4)
         {
-            int n = __ldg(&nlist[j]);
-            if (n > v)
+            for (int j = beg; j < end; j++)
             {
-                int wei = __ldg(&eweight[j]);
-                bool ok = first ? (wei <= threshold) : (wei > threshold);
-                if (ok)
-                {
-                    int brep = first ? n : find(n, parent);
-                    if (first || (arep != brep))
+                const int n = nlist[j];
+                if (n > v)
+                { // only in one direction
+                    const int wei = eweight[j];
+                    if (first ? (wei <= threshold) : (wei > threshold))
                     {
-                        int k = atomicAdd(wl2size, 1);
-                        wl2[k] = int4{arep, brep, wei, j};
+                        const int brep = first ? n : find(n, parent);
+                        if (first || (arep != brep))
+                        {
+                            const int k = atomicAdd(wl2size, 1);
+                            wl2[k] = int4{arep, brep, wei, j}; // <from node, to node, weight, edge index>
+                        }
                     }
                 }
             }
         }
     }
-
-    const int WS = 32;
-    int lane = threadIdx.x & (WS - 1);
-    unsigned bal = __ballot_sync(~0U, deg >= 4);
-    while (bal)
+    const int WS = 32; // warp size
+    const int lane = threadIdx.x % WS;
+    int bal = __ballot_sync(~0, deg >= 4);
+    while (bal != 0)
     {
-        int who = __ffs(bal) - 1;
+        const int who = __ffs(bal) - 1;
         bal &= bal - 1;
-        int wi = __shfl_sync(~0U, v, who);
-        int wbeg = __shfl_sync(~0U, beg, who);
-        int wend = __shfl_sync(~0U, end, who);
-        int warep = first ? wi : __shfl_sync(~0U, arep, who);
+        const int wi = __shfl_sync(~0, v, who);
+        const int wbeg = __shfl_sync(~0, beg, who);
+        const int wend = __shfl_sync(~0, end, who);
+        const int warep = first ? wi : __shfl_sync(~0, arep, who);
         for (int j = wbeg + lane; j < wend; j += WS)
         {
-            int n = __ldg(&nlist[j]);
+            const int n = nlist[j];
             if (n > wi)
-            {
-                int wei = __ldg(&eweight[j]);
-                bool ok = first ? (wei <= threshold) : (wei > threshold);
-                if (ok)
+            { // only in one direction
+                const int wei = eweight[j];
+                if (first ? (wei <= threshold) : (wei > threshold))
                 {
-                    int brep = first ? n : find(n, parent);
+                    const int brep = first ? n : find(n, parent);
                     if (first || (warep != brep))
                     {
-                        int k = atomicAdd(wl2size, 1);
-                        wl2[k] = int4{warep, brep, wei, j};
+                        const int k = atomicAdd(wl2size, 1);
+                        wl2[k] = int4{warep, brep, wei, j}; // <from node, to node, weight, edge index>
                     }
                 }
             }
@@ -252,39 +234,38 @@ static __global__ void initWL(int4 *const __restrict__ wl2,
     }
 }
 
-static __global__ void kernel1(const int4 *const __restrict__ wl1,
-                               const int wl1size,
-                               int4 *const __restrict__ wl2,
-                               int *const __restrict__ wl2size,
-                               const int *const __restrict__ parent,
-                               volatile ull *const __restrict__ minv)
+static __global__ void kernel1(const int4 *const __restrict__ wl1, const int wl1size, int4 *const __restrict__ wl2, int *const __restrict__ wl2size, const int *const __restrict__ parent, volatile ull *const __restrict__ minv)
 {
-    int idx = blockIdx.x * ThreadsPerBlock + threadIdx.x;
-    if (idx >= wl1size)
-        return;
+    const int idx = threadIdx.x + blockIdx.x * ThreadsPerBlock;
 
-    int4 el = wl1[idx];
-    int arep = find(el.x, parent);
-    int brep = find(el.y, parent);
-    if (arep != brep)
+    if (idx < wl1size)
     {
-        el.x = arep;
-        el.y = brep;
-        int k = atomicAdd(wl2size, 1);
-        wl2[k] = el;
-        ull val = (((ull)el.z) << 32) | el.w;
-        atomicMin((ull *)&minv[arep], val);
-        atomicMin((ull *)&minv[brep], val);
+        int4 el = wl1[idx];
+
+        const int arep = find(el.x, parent);
+        const int brep = find(el.y, parent);
+
+        if (arep != brep)
+        {
+            el.x = arep;
+            el.y = brep;
+            wl2[atomicAdd(wl2size, 1)] = el;
+            const ull val = (((ull)el.z) << 32) | el.w;
+            if (minv[arep] > val) atomicMin((ull*)&minv[arep], val);
+            if (minv[brep] > val) atomicMin((ull*)&minv[brep], val);
+        }
     }
 }
 
 static __global__ void kernel2(const int4 *const __restrict__ wl, const int wlsize, int *const __restrict__ parent, ull *const __restrict__ minv, bool *const __restrict__ inMST)
 {
     const int idx = threadIdx.x + blockIdx.x * ThreadsPerBlock;
+
     if (idx < wlsize)
     {
         const int4 el = wl[idx];
         const ull val = (((ull)el.z) << 32) | el.w;
+
         if ((val == minv[el.x]) || (val == minv[el.y]))
         {
             join(el.x, el.y, parent);
@@ -315,41 +296,53 @@ static void CheckCuda(const int line)
     }
 }
 
+/* Allocated space in Unified Memory */
+
 template <bool filter>
 static bool *gpuMST(const ECLgraph &g, const int threshold)
 {
     bool *d_inMST = NULL;
-    cudaMalloc((void **)&d_inMST, g.edges * sizeof(bool));
+    cudaMallocManaged(&d_inMST, g.edges * sizeof(bool));
+
     bool *const inMST = new bool[g.edges];
 
     int *d_parent = NULL;
-    cudaMalloc((void **)&d_parent, g.nodes * sizeof(int));
+    cudaMallocManaged(&d_parent, g.nodes * sizeof(int));
 
     ull *d_minv = NULL;
-    cudaMalloc((void **)&d_minv, g.nodes * sizeof(ull));
+    cudaMallocManaged(&d_minv, g.nodes * sizeof(ull));
 
     int4 *d_wl1 = NULL;
-    cudaMalloc((void **)&d_wl1, g.edges / 2 * sizeof(int4));
-
-    int *d_wlsize = NULL;
-    cudaMalloc((void **)&d_wlsize, sizeof(int));
+    cudaMallocManaged(&d_wl1, g.edges / 2 * sizeof(int4));
 
     int4 *d_wl2 = NULL;
-    cudaMalloc((void **)&d_wl2, g.edges / 2 * sizeof(int4));
+    cudaMallocManaged(&d_wl2, g.edges / 2 * sizeof(int4));
+
+    int *d_wlsize = NULL;
+    cudaMallocManaged(&d_wlsize, sizeof(int));
 
     int *d_nindex = NULL;
-    cudaMalloc((void **)&d_nindex, (g.nodes + 1) * sizeof(int));
+    cudaMallocManaged(&d_nindex, (g.nodes + 1) * sizeof(int));
     cudaMemcpy(d_nindex, g.nindex, (g.nodes + 1) * sizeof(int), cudaMemcpyHostToDevice);
-
     int *d_nlist = NULL;
-    cudaMalloc((void **)&d_nlist, g.edges * sizeof(int));
+    cudaMallocManaged(&d_nlist, g.edges * sizeof(int));
     cudaMemcpy(d_nlist, g.nlist, g.edges * sizeof(int), cudaMemcpyHostToDevice);
 
     int *d_eweight = NULL;
-    cudaMalloc((void **)&d_eweight, g.edges * sizeof(int));
+    cudaMallocManaged(&d_eweight, g.edges * sizeof(int));
     cudaMemcpy(d_eweight, g.eweight, g.edges * sizeof(int), cudaMemcpyHostToDevice);
 
     CheckCuda(__LINE__);
+
+   cudaMemPrefetchAsync(d_inMST, g.edges * sizeof(bool), Device);
+   cudaMemPrefetchAsync(d_parent, g.nodes * sizeof(int), Device);
+   cudaMemPrefetchAsync(d_minv, g.nodes * sizeof(ull), Device);
+   cudaMemPrefetchAsync(d_wl1, g.edges / 2 * sizeof(int4), Device);
+   cudaMemPrefetchAsync(d_wl2, g.edges / 2 * sizeof(int4), Device);
+   cudaMemPrefetchAsync(d_wlsize, sizeof(int), Device);
+   cudaMemPrefetchAsync(d_nindex, (g.nodes + 1) * sizeof(int), Device);
+   cudaMemPrefetchAsync(d_nlist, g.edges * sizeof(int), Device);
+   cudaMemPrefetchAsync(d_eweight, g.edges * sizeof(int), Device);
 
     CPUTimer timer;
     timer.start();
@@ -373,8 +366,7 @@ static bool *gpuMST(const ECLgraph &g, const int threshold)
         if (wlsize > 0)
         {
             kernel2<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_parent, d_minv, d_inMST);
-            // kernel3<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_minv);
-            cudaMemset(d_minv, 0xFF, g.nodes * sizeof(ull));
+            kernel3<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_minv);
         }
     }
 
@@ -393,8 +385,7 @@ static bool *gpuMST(const ECLgraph &g, const int threshold)
             if (wlsize > 0)
             {
                 kernel2<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_parent, d_minv, d_inMST);
-                // kernel3<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_minv);
-                cudaMemset(d_minv, 0xFF, g.nodes * sizeof(ull));
+                kernel3<<<blocks, ThreadsPerBlock>>>(d_wl1, wlsize, d_minv);
             }
         }
     }
@@ -442,10 +433,7 @@ static void verify(const ECLgraph &g, const bool *const cpuMSTedges, const bool 
         if (cpuMSTedges[j])
             cpuMSTweight += g.eweight[j];
     }
-    printf("gpuMSTweight: %llu\n", gpuMSTweight);
-    printf("cpuMSTweight: %llu\n", cpuMSTweight);
-    printf("onluGpuMST: %d\n", onlyGpuMST);
-    printf("onluCpuMST: %d\n", onlyCpuMST);
+
     if ((gpuMSTweight != cpuMSTweight) || (onlyGpuMST != 0) || (onlyCpuMST != 0))
     {
         printf("ERROR: results differ!\n\n");
